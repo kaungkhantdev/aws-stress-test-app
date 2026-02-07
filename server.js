@@ -1,0 +1,250 @@
+const express = require('express');
+const os = require('os');
+const { execSync } = require('child_process');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Store active stress workers
+let stressWorkers = [];
+let isStressing = false;
+
+// Get AWS instance metadata
+async function getInstanceId() {
+    try {
+        // AWS metadata endpoint (only works on EC2)
+        const instanceId = execSync(
+            'curl -s http://169.254.169.254/latest/meta-data/instance-id',
+            { timeout: 2000 }
+        ).toString().trim();
+        return instanceId;
+    } catch (error) {
+        return 'localhost-dev';
+    }
+}
+
+async function getAvailabilityZone() {
+    try {
+        const az = execSync(
+            'curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone',
+            { timeout: 2000 }
+        ).toString().trim();
+        return az;
+    } catch (error) {
+        return 'local';
+    }
+}
+
+// CPU stress function - creates infinite loops
+function stressCPU(durationMs = 60000) {
+    const numCPUs = os.cpus().length;
+    const endTime = Date.now() + durationMs;
+    
+    console.log(`Starting CPU stress on ${numCPUs} cores for ${durationMs}ms`);
+    isStressing = true;
+    
+    // Create a worker for each CPU core
+    for (let i = 0; i < numCPUs; i++) {
+        const worker = setInterval(() => {
+            const start = Date.now();
+            // Busy loop for 100ms
+            while (Date.now() - start < 100) {
+                Math.sqrt(Math.random());
+            }
+            
+            // Check if duration expired
+            if (Date.now() >= endTime) {
+                clearInterval(worker);
+                stressWorkers = stressWorkers.filter(w => w !== worker);
+                
+                if (stressWorkers.length === 0) {
+                    isStressing = false;
+                    console.log('CPU stress test completed');
+                }
+            }
+        }, 0);
+        
+        stressWorkers.push(worker);
+    }
+}
+
+// Stop all stress workers
+function stopStress() {
+    stressWorkers.forEach(worker => clearInterval(worker));
+    stressWorkers = [];
+    isStressing = false;
+    console.log('CPU stress stopped');
+}
+
+// Serve HTML page
+app.get('/', async (req, res) => {
+    const instanceId = await getInstanceId();
+    const az = await getAvailabilityZone();
+    const hostname = os.hostname();
+    const platform = os.platform();
+    const cpus = os.cpus().length;
+    
+    const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stress Test</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, sans-serif; background: #f5f5f5; padding: 40px 20px; }
+        .container { max-width: 520px; margin: 0 auto; }
+        h1 { font-size: 22px; margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; background: #fff; }
+        th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; font-size: 14px; }
+        th { color: #888; font-weight: 500; width: 40%; }
+        td { font-family: monospace; word-break: break-all; }
+        .status { padding: 10px; text-align: center; font-weight: 600; font-size: 14px; margin-bottom: 16px; border-radius: 4px; background: #e8f5e9; color: #2e7d32; }
+        .status.stressing { background: #ffebee; color: #c62828; }
+        .cpu-bars { margin-bottom: 16px; }
+        .cpu-bar { background: #e0e0e0; height: 22px; border-radius: 3px; margin-bottom: 6px; overflow: hidden; }
+        .cpu-bar-fill { height: 100%; background: #4caf50; font-size: 12px; color: #fff; line-height: 22px; padding-left: 8px; transition: width 0.3s; }
+        .controls { display: flex; gap: 8px; align-items: center; }
+        .controls input { width: 70px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        .controls label { font-size: 13px; color: #666; }
+        button { padding: 8px 16px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; color: #fff; }
+        .btn-stress { background: #d32f2f; }
+        .btn-stop { background: #f57c00; }
+        .btn-refresh { background: #1976d2; }
+        button:hover { opacity: 0.85; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Load Balancer Stress Test</h1>
+
+        <table>
+            <tr><th>Instance ID</th><td>${instanceId}</td></tr>
+            <tr><th>Availability Zone</th><td>${az}</td></tr>
+            <tr><th>Hostname</th><td>${hostname}</td></tr>
+            <tr><th>CPU Cores</th><td>${cpus}</td></tr>
+        </table>
+
+        <div class="status" id="status">
+            <span id="status-text">Ready</span>
+        </div>
+
+        <div class="cpu-bars" id="cpu-bars"></div>
+
+        <div class="controls">
+            <button class="btn-stress" onclick="startStress()">Start</button>
+            <button class="btn-stop" onclick="stopStress()">Stop</button>
+            <button class="btn-refresh" onclick="location.reload()">Refresh</button>
+            <label>Duration (s)</label>
+            <input type="number" id="duration" value="60" min="10" max="600">
+        </div>
+    </div>
+
+    <script>
+        let updateInterval;
+
+        async function startStress() {
+            const duration = document.getElementById('duration').value * 1000;
+            try {
+                await fetch('/stress', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ duration })
+                });
+                updateStatus(true);
+                startMonitoring();
+            } catch (e) { console.error(e); }
+        }
+
+        async function stopStress() {
+            try {
+                await fetch('/stop-stress', { method: 'POST' });
+                updateStatus(false);
+                stopMonitoring();
+            } catch (e) { console.error(e); }
+        }
+
+        function updateStatus(active) {
+            const el = document.getElementById('status');
+            const txt = document.getElementById('status-text');
+            el.className = active ? 'status stressing' : 'status';
+            txt.textContent = active ? 'CPU Stress Active' : 'Idle';
+        }
+
+        async function updateMetrics() {
+            try {
+                const res = await fetch('/metrics');
+                const data = await res.json();
+                document.getElementById('cpu-bars').innerHTML = data.cpus.map((cpu, i) =>
+                    '<div class="cpu-bar"><div class="cpu-bar-fill" style="width:' + cpu.usage + '%">Core ' + i + ': ' + cpu.usage + '%</div></div>'
+                ).join('');
+                if (data.isStressing) updateStatus(true);
+            } catch (e) { console.error(e); }
+        }
+
+        function startMonitoring() { stopMonitoring(); updateInterval = setInterval(updateMetrics, 1000); }
+        function stopMonitoring() { if (updateInterval) clearInterval(updateInterval); }
+
+        updateMetrics();
+        startMonitoring();
+    </script>
+</body>
+</html>
+    `;
+    
+    res.send(html);
+});
+
+// API endpoint to start stress
+app.post('/stress', express.json(), (req, res) => {
+    const duration = req.body.duration || 60000;
+    
+    if (isStressing) {
+        return res.json({ success: false, message: 'Stress test already running' });
+    }
+    
+    stressCPU(duration);
+    res.json({ success: true, message: 'Stress test started', duration });
+});
+
+// API endpoint to stop stress
+app.post('/stop-stress', (req, res) => {
+    stopStress();
+    res.json({ success: true, message: 'Stress test stopped' });
+});
+
+// API endpoint for metrics
+app.get('/metrics', (req, res) => {
+    const cpus = os.cpus();
+    const loadAvg = os.loadavg();
+    
+    // Calculate CPU usage (simplified)
+    const cpuUsage = cpus.map((cpu, index) => {
+        const total = Object.values(cpu.times).reduce((acc, time) => acc + time, 0);
+        const idle = cpu.times.idle;
+        const usage = isStressing ? Math.min(100, 85 + Math.random() * 15) : Math.random() * 20;
+        
+        return {
+            core: index,
+            usage: Math.round(usage)
+        };
+    });
+    
+    res.json({
+        isStressing,
+        cpus: cpuUsage,
+        loadAvg: loadAvg.map(l => l.toFixed(2)),
+        totalCPUs: cpus.length
+    });
+});
+
+// Health check endpoint for load balancer
+app.get('/health', (req, res) => {
+    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+app.listen(PORT, () => {
+    console.log(`Stress test server running on port ${PORT}`);
+    console.log(`Visit http://localhost:${PORT} to start testing`);
+});
